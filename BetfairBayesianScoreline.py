@@ -24,18 +24,21 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize, root_scalar
 
+from odds_devig import normalize, shin_devig
+
 
 Score = Tuple[int, int]
 MAX_EXACT_SCORE = 3
 TAIL_HOME = "Any other home victory"
 TAIL_DRAW = "Any other draw"
-TAIL_AWAY = "Any other visitant victory"
+TAIL_AWAY = "Any other away victory"
 TAIL_KEY_HOME = "H_OTHER"
 TAIL_KEY_DRAW = "D_OTHER"
 TAIL_KEY_AWAY = "A_OTHER"
 
 
 def result_category(score: Score) -> int:
+    """Map a scoreline to outcome category: 0=home, 1=draw, 2=away."""
     if score[0] > score[1]:
         return 0
     if score[0] == score[1]:
@@ -44,6 +47,7 @@ def result_category(score: Score) -> int:
 
 
 def tail_label(category: int) -> str:
+    """Return a human-readable label for a tail outcome category."""
     if category == 0:
         return TAIL_HOME
     if category == 1:
@@ -53,74 +57,35 @@ def tail_label(category: int) -> str:
 
 @dataclass(frozen=True)
 class MarketOdds:
+    """Input market odds required by the scoreline calibration pipeline."""
     match_odds: Sequence[float]
     over_under_25: Sequence[float]
     btts: Sequence[float]
     correct_score: Sequence[Tuple[object, float]]
 
-
-def normalize(values: np.ndarray) -> np.ndarray:
-    total = float(np.sum(values))
-    if not np.isfinite(total) or total <= 0.0:
-        raise ValueError("Cannot normalize a non-positive vector.")
-    return values / total
-
-
-def shin_devig(odds: Sequence[float]) -> Tuple[np.ndarray, float]:
-    """Remove bookmaker margin using Shin's formulation.
-
-    Falls back to proportional normalization if the root solve is ill-posed.
-    """
-
-    odds_array = np.asarray(odds, dtype=float)
-    if odds_array.ndim != 1 or odds_array.size < 2:
-        raise ValueError("Shin devigging requires at least two outcomes.")
-
-    implied = 1.0 / odds_array
-    implied_sum = float(np.sum(implied))
-
-    def shin_probs(z: float) -> np.ndarray:
-        return (
-            np.sqrt(z * z + 4.0 * (1.0 - z) * (implied * implied / implied_sum)) - z
-        ) / (2.0 * (1.0 - z))
-
-    def objective(z: float) -> float:
-        return float(np.sum(shin_probs(z)) - 1.0)
-
-    lower = 0.0
-    upper = 1.0 - 1e-8
-    try:
-        lower_value = objective(lower)
-        upper_value = objective(upper)
-        if lower_value * upper_value > 0:
-            return normalize(implied), 0.0
-
-        solution = root_scalar(objective, bracket=[lower, upper], method="brentq")
-        z_value = float(solution.root)
-        return normalize(shin_probs(z_value)), z_value
-    except Exception:
-        return normalize(implied), 0.0
-
-
 def score_grid(max_goals: int = MAX_EXACT_SCORE) -> List[str]:
+    """Return canonical exact-score labels plus tail buckets."""
     labels = [score_label((home_goals, away_goals)) for home_goals in range(max_goals + 1) for away_goals in range(max_goals + 1)]
     labels.extend([TAIL_HOME, TAIL_DRAW, TAIL_AWAY])
     return labels
 
 
 def score_label(score: Score, max_exact_score: int = MAX_EXACT_SCORE) -> str:
+    """Format a scoreline label, collapsing beyond-grid scores to tail labels."""
     if score[0] <= max_exact_score and score[1] <= max_exact_score:
         return f"{score[0]}-{score[1]}"
     return tail_label(result_category(score))
 
 
 def exact_score_key(value: object) -> object:
+    """Normalize exact-score keys from tuple-like values to integer tuples."""
     if isinstance(value, tuple) and len(value) == 2:
         return (int(value[0]), int(value[1]))
     return value
 
 
 def tail_market_category(value: object) -> int | None:
+    """Map market tail tokens to outcome categories."""
     if value == TAIL_KEY_HOME:
         return 0
     if value == TAIL_KEY_DRAW:
@@ -131,6 +96,7 @@ def tail_market_category(value: object) -> int | None:
 
 
 def devig_exact_score_market(quoted_odds: Sequence[Tuple[object, float]]) -> Dict[object, float]:
+    """Apply Shin de-vigging to all quoted exact-score outcomes."""
     keys = [exact_score_key(key) for key, _ in quoted_odds]
     odds = [float(odds_value) for _, odds_value in quoted_odds]
     probs, _ = shin_devig(odds)
@@ -138,11 +104,13 @@ def devig_exact_score_market(quoted_odds: Sequence[Tuple[object, float]]) -> Dic
 
 
 def poisson_pmf_vector(lam: float, max_goals: int) -> np.ndarray:
+    """Build a truncated Poisson PMF and renormalize the finite support."""
     values = np.array([exp(-lam) * (lam**goal) / factorial(goal) for goal in range(max_goals + 1)], dtype=float)
     return normalize(values)
 
 
 def poisson_joint_grid(lambda_home: float, lambda_away: float, max_goals: int) -> np.ndarray:
+    """Create the independent home/away Poisson joint score grid."""
     home_pmf = poisson_pmf_vector(lambda_home, max_goals)
     away_pmf = poisson_pmf_vector(lambda_away, max_goals)
     joint = np.outer(home_pmf, away_pmf)
@@ -150,6 +118,7 @@ def poisson_joint_grid(lambda_home: float, lambda_away: float, max_goals: int) -
 
 
 def model_marginals(lambda_home: float, lambda_away: float, max_goals: int) -> Dict[str, np.ndarray]:
+    """Derive 1X2, goal-band, and BTTS marginals from a score grid."""
     joint = poisson_joint_grid(lambda_home, lambda_away, max_goals)
     outcome = np.zeros(3, dtype=float)
     band = np.zeros(2, dtype=float)
@@ -190,6 +159,7 @@ def fit_goal_intensities(
     target_btts: np.ndarray,
     max_goals: int,
 ) -> Tuple[float, float]:
+    """Fit Poisson intensities to market-implied marginals via least squares."""
     def objective(params: np.ndarray) -> float:
         lambda_home, lambda_away = float(params[0]), float(params[1])
         if lambda_home <= 0.0 or lambda_away <= 0.0:
@@ -257,6 +227,7 @@ def build_exact_score_prior(
                 tail_mass[result_category((home_goals, away_goals))] += float(probability)
 
     unquoted_mask = ~quoted_mask
+    # Use the Poisson background for quoted-market gaps to keep a full support grid.
     market_grid[unquoted_mask] = prior[unquoted_mask]
 
     for category, mass in enumerate(tail_mass):
@@ -266,6 +237,7 @@ def build_exact_score_prior(
             mask = np.zeros_like(prior, dtype=bool)
             for home_goals in range(max_goals + 1):
                 for away_goals in range(max_goals + 1):
+                    # Tail buckets only cover states outside the explicit exact-score board.
                     mask[home_goals, away_goals] = home_goals > MAX_EXACT_SCORE and away_goals > MAX_EXACT_SCORE and home_goals > away_goals
         elif category == 1:
             mask = np.zeros_like(prior, dtype=bool)
@@ -295,6 +267,7 @@ def calibrate_distribution(
     max_iterations: int = 4000,
     tolerance: float = 1e-14,
 ) -> np.ndarray:
+    """Calibrate the prior grid to match target marginals with IPF updates."""
     calibrated = np.array(prior, dtype=float)
 
     outcome_index = np.zeros_like(calibrated, dtype=int)
@@ -345,6 +318,7 @@ def calibrate_distribution(
             if mass > 0.0:
                 flat[mask] *= float(target) / mass
 
+        # Renormalize after each full IPF sweep to avoid floating-point drift.
         flat = normalize(flat)
         if float(np.max(np.abs(flat - previous))) < tolerance:
             break

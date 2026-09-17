@@ -1,95 +1,66 @@
+"""Compare de-vigging methods on 1X2 vs exact-score consistency.
+
+The script removes bookmaker margin from:
+- A liquid 1X2 market (baseline)
+- A heavier-margin exact-score market (reconstructed to 1X2)
+
+It then reports KL divergence to show which de-vigging method better preserves
+the 1X2 distribution when applied to exact-score prices.
+"""
+
 import numpy as np
-from scipy.optimize import root_scalar
 from scipy.stats import entropy
 
-def de_vig_power(odds):
-    """
-    Applies the Power Method to remove the bookmaker margin.
-    Finds k such that sum( (1/odds)^k ) = 1
-    """
-    odds = np.array(odds)
-    implied = 1.0 / odds
-    
-    def objective(k):
-        return np.sum(implied**k) - 1.0
-        
-    sol = root_scalar(objective, bracket=[1.0, 10.0], method='brentq')
-    k = sol.root
-    true_probs = implied**k
-    return true_probs, k
+from odds_devig import power_devig, shin_devig
 
-def de_vig_shin(odds):
-    """
-    Applies Shin's Method to remove the bookmaker margin.
-    Finds z (proportion of insider money) such that sum(p_i) = 1
-    """
-    odds = np.array(odds)
-    implied = 1.0 / odds
-    implied_sum = np.sum(implied)
-    
-    def shin_probs(z):
-        return (np.sqrt(z**2 + 4 * (1 - z) * (implied**2 / implied_sum)) - z) / (2 * (1 - z))
 
-    def objective(z):
-        return np.sum(shin_probs(z)) - 1.0
+def recover_1x2_from_exact(
+    exact_probs: np.ndarray,
+    home_len: int,
+    draw_len: int,
+) -> list[float]:
+    """Aggregate exact-score probabilities back into Home/Draw/Away buckets."""
+    home_prob = np.sum(exact_probs[:home_len])
+    draw_prob = np.sum(exact_probs[home_len : home_len + draw_len])
+    away_prob = np.sum(exact_probs[home_len + draw_len :])
+    return [float(home_prob), float(draw_prob), float(away_prob)]
 
-    lower = 0.0
-    upper = 1.0 - 1e-8
-    f_lower = objective(lower)
-    f_upper = objective(upper)
 
-    if f_lower * f_upper > 0:
-        true_probs = implied / implied_sum
-        return true_probs, 0.0
-
-    sol = root_scalar(objective, bracket=[lower, upper], method='brentq')
-    z = sol.root
-    true_probs = shin_probs(z)
-    return true_probs, z
-
-def main():
-    # 1. Input: Highly liquid 1X2 Odds [Home, Draw, Away]
+def main() -> None:
+    """Run the method comparison and print formatted results."""
+    # Input: highly liquid 1X2 odds [Home, Draw, Away].
     odds_1x2 = [1.71, 5.0, 4.3] 
     
-    # 2. Input: Illiquid Exact Score Odds (categorized by outcome)
-    # The list must be exhaustive. Real markets use "Any Other Home/Away/Draw" to catch the rest.
+    # Input: illiquid exact-score odds grouped by final outcome.
+    # The list is exhaustive by using "Any Other ..." buckets.
     exact_odds = {
-        'Home': [11.0, 11.0, 9.4, 16.5, 13.5, 18.5, 6.8], # 1-0, 2-0, 2-1, 3-0, 3-1, 3-2, Any Other Home
-        'Draw': [20.0, 9.8, 15.0, 55, 95.0],                    # 0-0, 1-1, 2-2, Any Other Draw
-        'Away': [22.0, 38.0, 18.0, 40.0, 28.0, 46.0, 27.0]  # 0-1, 0-2, 1-2, 0-3, 1-3, 2-3, Any Other Away
+        "Home": [11.0, 11.0, 9.4, 16.5, 13.5, 18.5, 6.8],  # 1-0, 2-0, 2-1, 3-0, 3-1, 3-2, Any Other Home
+        "Draw": [20.0, 9.8, 15.0, 55, 95.0],  # 0-0, 1-1, 2-2, Any Other Draw
+        "Away": [22.0, 38.0, 18.0, 40.0, 28.0, 46.0, 27.0],  # 0-1, 0-2, 1-2, 0-3, 1-3, 2-3, Any Other Away
     }
     
     # Flatten exact odds to de-vig them all simultaneously
-    flat_exact_odds = exact_odds['Home'] + exact_odds['Draw'] + exact_odds['Away']
+    flat_exact_odds = exact_odds["Home"] + exact_odds["Draw"] + exact_odds["Away"]
     
-    # --- Step A: De-vig the 1X2 Market (Our Baseline 'True' Distribution) ---
-    p_1x2_power, _ = de_vig_power(odds_1x2)
-    p_1x2_shin, _  = de_vig_shin(odds_1x2)
+    # Step A: de-vig the 1X2 market (baseline distribution).
+    p_1x2_power, _ = power_devig(odds_1x2)
+    p_1x2_shin, _ = shin_devig(odds_1x2)
     
-    # --- Step B: De-vig the Exact Score Market ---
-    p_exact_power, _ = de_vig_power(flat_exact_odds)
-    p_exact_shin, _  = de_vig_shin(flat_exact_odds)
+    # Step B: de-vig the exact-score market.
+    p_exact_power, _ = power_devig(flat_exact_odds)
+    p_exact_shin, _ = shin_devig(flat_exact_odds)
     
-    # --- Step C: Recover the 1X2 probabilities from Exact Scores ---
-    # Determine the slice indices for Home, Draw, Away
-    h_len = len(exact_odds['Home'])
-    d_len = len(exact_odds['Draw'])
+    # Step C: recover Home/Draw/Away probabilities from exact scores.
+    h_len = len(exact_odds["Home"])
+    d_len = len(exact_odds["Draw"])
+    q_1x2_power = recover_1x2_from_exact(p_exact_power, h_len, d_len)
+    q_1x2_shin = recover_1x2_from_exact(p_exact_shin, h_len, d_len)
     
-    def recover_1x2(exact_probs):
-        home_prob = np.sum(exact_probs[:h_len])
-        draw_prob = np.sum(exact_probs[h_len : h_len + d_len])
-        away_prob = np.sum(exact_probs[h_len + d_len:])
-        return [home_prob, draw_prob, away_prob]
-
-    q_1x2_power = recover_1x2(p_exact_power)
-    q_1x2_shin  = recover_1x2(p_exact_shin)
-    
-    # --- Step D: Measure the KL Divergence ---
-    # D_KL(P || Q) measures how much information is lost when Q is used to approximate P.
+    # Step D: measure KL divergence, D_KL(P || Q).
     kl_power = entropy(p_1x2_power, q_1x2_power)
-    kl_shin  = entropy(p_1x2_shin, q_1x2_shin)
+    kl_shin = entropy(p_1x2_shin, q_1x2_shin)
     
-    # --- Output Results ---
+    # Output
     print(f"{'Distribution':<14} | {'Method':<6} | {'Home':<6} | {'Draw':<6} | {'Away':<6}")
     print("-" * 47)
     print(f"{'Baseline (1X2)':<14} | {'Power':<6} | {p_1x2_power[0]:.4f} | {p_1x2_power[1]:.4f} | {p_1x2_power[2]:.4f}")
@@ -102,6 +73,7 @@ def main():
     print(f"KL Divergence (Shin):  {kl_shin:.6f}")
     print("\nResult: The method with the lower KL divergence maps the heavy-margin")
     print("exact score market back to the liquid 1X2 baseline more accurately.")
+
 
 if __name__ == "__main__":
     main()
